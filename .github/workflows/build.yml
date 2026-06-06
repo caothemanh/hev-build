@@ -1,0 +1,73 @@
+name: Build hev-socks5-tunnel for Android
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:   # cho phép chạy thủ công
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      # ── 1. Checkout repo này ─────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Clone hev-socks5-tunnel (recursive để kéo submodules) ────────
+      - name: Clone hev-socks5-tunnel source
+        run: |
+          git clone --depth=1 --recursive \
+            https://github.com/heiher/hev-socks5-tunnel \
+            jni/hev-socks5-tunnel
+
+      # ── 3. Cài NDK r27 (stable, hỗ trợ API 21+) ─────────────────────────
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+          add-to-path: true
+
+      # ── 4. Build bằng ndk-build ─────────────────────────────────────────
+      - name: Build with ndk-build
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          echo "NDK path: $ANDROID_NDK_HOME"
+          $ANDROID_NDK_HOME/ndk-build \
+            NDK_PROJECT_PATH=. \
+            NDK_APPLICATION_MK=jni/Application.mk \
+            APP_BUILD_SCRIPT=jni/Android.mk \
+            NDK_LIBS_OUT=./libs \
+            NDK_OUT=./obj \
+            -j$(nproc) \
+            V=1
+
+      # ── 5. List kết quả ─────────────────────────────────────────────────
+      - name: List output files
+        run: |
+          echo "=== Built .so files ==="
+          find libs -name "*.so" -exec ls -lh {} \;
+
+      # ── 6. Đóng gói zip ─────────────────────────────────────────────────
+      - name: Package artifact
+        run: |
+          mkdir -p artifact/jni
+          cp -r libs/arm64-v8a   artifact/jni/ 2>/dev/null || true
+          cp -r libs/armeabi-v7a artifact/jni/ 2>/dev/null || true
+          cp -r libs/x86         artifact/jni/ 2>/dev/null || true
+          cp -r libs/x86_64      artifact/jni/ 2>/dev/null || true
+          cd artifact
+          zip -r ../hev-socks5-tunnel-android.zip jni/
+          cd ..
+          echo "=== Zip contents ==="
+          unzip -l hev-socks5-tunnel-android.zip
+
+      # ── 7. Upload artifact ───────────────────────────────────────────────
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hev-socks5-tunnel-android
+          path: hev-socks5-tunnel-android.zip
+          retention-days: 30
