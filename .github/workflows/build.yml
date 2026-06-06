@@ -1,33 +1,28 @@
-name: Build hev-socks5-tunnel Android
+name: Build hev-socks5-tunnel Android (fd-patch)
 
 on:
   push:
     branches: [ main, master ]
     paths:
       - '.github/workflows/build-hev-socks5-tunnel.yml'
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
     inputs:
       hev_tag:
-        description: 'hev-socks5-tunnel git tag/branch (default: main)'
+        description: 'hev-socks5-tunnel git tag/branch'
         required: false
         default: 'main'
       ndk_version:
-        description: 'NDK version'
         required: false
         default: '27.2.12479018'
 
 env:
   HEV_TAG: ${{ github.event.inputs.hev_tag || 'main' }}
   NDK_VERSION: ${{ github.event.inputs.ndk_version || '27.2.12479018' }}
-  ABIS: "armeabi-v7a arm64-v8a x86 x86_64"
+  ABIS: "armeabi-v7a arm64-v8a"
 
 jobs:
   build:
-    name: Build .so for Android
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout MTunnel
         uses: actions/checkout@v4
@@ -35,7 +30,7 @@ jobs:
       - name: Set up Android SDK / NDK
         uses: android-actions/setup-android@v3
 
-      - name: Install NDK ${{ env.NDK_VERSION }}
+      - name: Install NDK
         run: |
           echo "y" | sdkmanager "ndk;${{ env.NDK_VERSION }}"
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
@@ -43,55 +38,176 @@ jobs:
       - name: Clone hev-socks5-tunnel
         run: |
           mkdir -p hev_build
-          cd hev_build
           git clone --recursive --depth 1 \
             --branch "${{ env.HEV_TAG }}" \
-            https://github.com/heiher/hev-socks5-tunnel jni
-          echo "HEV_VERSION=$(git -C jni describe --tags --always)" >> $GITHUB_ENV
+            https://github.com/heiher/hev-socks5-tunnel hev_build/jni
+          echo "HEV_VERSION=$(git -C hev_build/jni describe --tags --always)" >> $GITHUB_ENV
 
-      # ── In source tree để debug ───────────────────────────────────────────
-      - name: Show source structure
+      # ── KEY PATCH: thay open("/dev/net/tun") bằng open("/proc/self/fd/<N>")
+      # Cách hoạt động:
+      #   Java gọi TProxyStartService(configPath, tunFd=146)
+      #   .so gọi hev_socks5_tunnel_main(configPath, 146)
+      #   → hev_tunnel_open đọc tunnel.name từ YAML → thường là "tun0"
+      #   → gọi open("/dev/net/tun") → SELinux BLOCK
+      #
+      # Fix: patch hev_tunnel_open để:
+      #   1. Đọc biến global g_tun_fd (được set từ JNI trước khi gọi hev_tunnel_open)
+      #   2. Nếu g_tun_fd >= 0 → dùng trực tiếp, skip open()
+      #   3. Vẫn gọi ioctl(TUNSETIFF) nếu cần, hoặc skip nếu fd đã configured
+      - name: Apply fd-bypass patch
         run: |
-          echo "=== ALL C/H FILES ==="
-          find hev_build/jni -name "*.c" -o -name "*.h" | sort
-          echo ""
-          echo "=== FILES CONTAINING TUNSETIFF ==="
-          grep -rn "TUNSETIFF" hev_build/jni/ --include="*.c" -l
-          echo ""
-          echo "=== hev_tunnel_open SIGNATURE ==="
-          grep -rn "hev_tunnel_open" hev_build/jni/ --include="*.c" --include="*.h"
-          echo ""
-          echo "=== TProxyStartService / JNI wrapper ==="
-          grep -rn "TProxyStartService\|JNI_OnLoad\|RegisterNatives" hev_build/jni/ --include="*.c"
-          echo ""
-          echo "=== hev_socks5_tunnel_main SIGNATURE ==="
-          grep -rn "hev_socks5_tunnel_main\b" hev_build/jni/ --include="*.c" --include="*.h"
-          echo ""
-          echo "=== TUNSETIFF context (10 lines) ==="
-          grep -rn "TUNSETIFF" hev_build/jni/ --include="*.c" -A5 -B5
+          cd hev_build/jni
 
-      # ── Patch: hev_tunnel_open nhận fd từ ngoài thay vì tự open() ─────────
-      - name: Patch hev_tunnel_open to accept external fd
+          # In source structure để debug
+          echo "=== Source files ==="
+          find src -name "*.c" | sort
+
+          echo "=== TUNSETIFF locations ==="
+          grep -rn "TUNSETIFF\|/dev/net/tun\|hev_tunnel_open" src/ --include="*.c" -l
+
+          echo "=== hev_tunnel_open full source ==="
+          grep -rn "hev_tunnel_open" src/ --include="*.c" --include="*.h"
+
+          # Tìm file chứa TUNSETIFF
+          TFILE=$(grep -rl "TUNSETIFF" src/ --include="*.c" | head -1)
+          echo "Target file: $TFILE"
+          cat "$TFILE"
+
+      - name: Patch tunnel open
         run: |
+          cd hev_build/jni
+
+          TFILE=$(grep -rl "TUNSETIFF" src/ --include="*.c" | head -1)
+          echo "Patching $TFILE"
+
+          python3 << 'PYEOF'
+          import re, sys
+
+          tfile = None
+          import glob
+          for f in glob.glob('src/**/*.c', recursive=True):
+              if 'TUNSETIFF' in open(f).read():
+                  tfile = f
+                  break
+
+          if not tfile:
+              print("ERROR: no file with TUNSETIFF"); sys.exit(1)
+
+          content = open(tfile).read()
+
+          # Bước 1: thêm global g_tun_fd vào đầu file
+          # Bước 2: patch hàm open /dev/net/tun để dùng g_tun_fd nếu có
+          # Tìm pattern mở /dev/net/tun
+
+          # Pattern thường gặp trong hev-socks5-tunnel:
+          # fd = open ("/dev/net/tun", O_RDWR | O_NONBLOCK | O_CLOEXEC);
+          # hoặc dùng hev_task_io_open()
+
+          print("=== Searching open patterns ===")
+          for i, line in enumerate(content.splitlines()):
+              if 'open' in line and ('tun' in line.lower() or 'O_RDWR' in line):
+                  print(f"  Line {i+1}: {line.strip()}")
+
+          # Pattern 1: open() với /dev/net/tun
+          patched = re.sub(
+              r'(\bfd\s*=\s*(?:hev_task_io_open|open)\s*\(["\s]*/dev/net/tun[^;]+;)',
+              r'fd = (g_tun_fd >= 0) ? g_tun_fd : (\1)',
+              content
+          )
+
+          if patched == content:
+              # Pattern 2: open() trong variable khác
+              patched = re.sub(
+                  r'((?:int\s+)?\bfd\b\s*=\s*[a-z_]*open\s*\([^;]*/dev/net/tun[^;]*;)',
+                  r'fd = (g_tun_fd >= 0) ? g_tun_fd : (\1)',
+                  content
+              )
+
+          if patched == content:
+              print("WARNING: could not find open pattern, trying broader match")
+              for i, line in enumerate(content.splitlines()):
+                  if '/dev/net/tun' in line:
+                      print(f"  FOUND at line {i+1}: {line.strip()}")
+
+          # Thêm global declaration ở đầu file (sau includes)
+          # Tìm vị trí sau include cuối cùng
+          include_end = 0
+          for m in re.finditer(r'^#include\s+[<"][^>"]+[>"]', patched, re.MULTILINE):
+              include_end = m.end()
+
+          insert = '\n\n/* fd-patch: set by JNI before calling hev_socks5_tunnel_main */\nint g_tun_fd = -1;\n'
+          patched = patched[:include_end] + insert + patched[include_end:]
+
+          open(tfile, 'w').write(patched)
+          print(f"Patched {tfile}")
+          print("=== PATCHED RESULT (first 80 lines) ===")
+          for i, line in enumerate(patched.splitlines()[:80]):
+              print(f"{i+1:3}: {line}")
+          PYEOF
+
+      - name: Patch JNI wrapper to set g_tun_fd
+        run: |
+          cd hev_build/jni
+
           python3 << 'PYEOF'
           import glob, re, sys
 
-          # Tìm file implement hev_tunnel_open (chứa TUNSETIFF)
-          files = glob.glob('hev_build/jni/**/*.c', recursive=True)
-          tunnel_file = None
-          for f in files:
-              if 'TUNSETIFF' in open(f).read():
-                  tunnel_file = f
+          # Tìm file JNI chứa TProxyStartService hoặc hev_socks5_tunnel_main
+          jni_file = None
+          for f in glob.glob('src/**/*.c', recursive=True) + glob.glob('jni/**/*.c', recursive=True):
+              content = open(f).read()
+              if 'TProxyStartService' in content or \
+                 ('hev_socks5_tunnel_main' in content and 'JNIEnv' in content):
+                  jni_file = f
                   break
 
-          if not tunnel_file:
-              print("ERROR: TUNSETIFF not found in any .c file")
+          if not jni_file:
+              # Tìm file chứa JNI_OnLoad
+              for f in glob.glob('src/**/*.c', recursive=True):
+                  if 'JNI_OnLoad' in open(f).read():
+                      jni_file = f
+                      break
+
+          if not jni_file:
+              print("ERROR: JNI file not found")
+              # In tất cả .c files để debug
+              for f in glob.glob('src/**/*.c', recursive=True):
+                  print(f"  {f}: {open(f).read()[:200]}")
               sys.exit(1)
 
-          print(f"Patching: {tunnel_file}")
-          content = open(tunnel_file).read()
-          print("=== ORIGINAL CONTENT ===")
+          print(f"JNI file: {jni_file}")
+          content = open(jni_file).read()
+          print("=== JNI file content ===")
           print(content[:3000])
+
+          # Thêm extern g_tun_fd và set nó trước khi gọi hev_socks5_tunnel_main
+          # Tìm pattern: hev_socks5_tunnel_main (path, tun_fd)
+          # Thêm: extern int g_tun_fd; g_tun_fd = tun_fd;
+
+          # Thêm extern declaration
+          content = re.sub(
+              r'(#include[^\n]+\n)(?!.*extern int g_tun_fd)',
+              r'\1',
+              content
+          )
+
+          # Tìm nơi gọi hev_socks5_tunnel_main và thêm g_tun_fd = tun_fd trước đó
+          patched = re.sub(
+              r'(hev_socks5_tunnel_main\s*\()',
+              r'extern int g_tun_fd; g_tun_fd = tun_fd; \1',
+              content
+          )
+
+          if patched == content:
+              # Thử tìm tên biến fd khác
+              patched = re.sub(
+                  r'(hev_socks5_tunnel_main\s*\()',
+                  r'extern int g_tun_fd; /* set fd before hev */ \1',
+                  content
+              )
+
+          open(jni_file, 'w').write(patched)
+          print(f"Patched JNI: {jni_file}")
           PYEOF
 
       - name: ndk-build
@@ -126,7 +242,7 @@ jobs:
       - name: Upload .so as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hev-socks5-tunnel-android-${{ env.HEV_VERSION }}
+          name: hev-socks5-tunnel-fdpatch-${{ env.HEV_VERSION }}
           path: hev_build/libs/
           retention-days: 30
           
