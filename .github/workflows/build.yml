@@ -1,73 +1,105 @@
-name: Build hev-socks5-tunnel for Android
+name: Build hev-socks5-tunnel Android
 
 on:
   push:
     branches: [ main, master ]
-  workflow_dispatch:   # cho phép chạy thủ công
+    paths:
+      - '.github/workflows/build-hev-socks5-tunnel.yml'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      hev_tag:
+        description: 'hev-socks5-tunnel git tag/branch (default: main)'
+        required: false
+        default: 'main'
+      ndk_version:
+        description: 'NDK version'
+        required: false
+        default: '27.2.12479018'
+
+env:
+  HEV_TAG: ${{ github.event.inputs.hev_tag || 'main' }}
+  NDK_VERSION: ${{ github.event.inputs.ndk_version || '27.2.12479018' }}
+  # Các ABI cần build — bỏ bớt nếu không dùng x86/x86_64
+  ABIS: "armeabi-v7a arm64-v8a x86 x86_64"
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    name: Build .so for Android
+    runs-on: ubuntu-latest
 
     steps:
-      # ── 1. Checkout repo này ─────────────────────────────────────────────
-      - name: Checkout
+      # ── 1. Checkout repo chính (MTunnel) ──────────────────────────────────
+      - name: Checkout MTunnel
         uses: actions/checkout@v4
 
-      # ── 2. Clone hev-socks5-tunnel (recursive để kéo submodules) ────────
-      - name: Clone hev-socks5-tunnel source
-        run: |
-          git clone --depth=1 --recursive \
-            https://github.com/heiher/hev-socks5-tunnel \
-            jni/hev-socks5-tunnel
+      # ── 2. Cài Android SDK + NDK ──────────────────────────────────────────
+      - name: Set up Android SDK / NDK
+        uses: android-actions/setup-android@v3
 
-      # ── 3. Cài NDK r27 (stable, hỗ trợ API 21+) ─────────────────────────
-      - name: Setup Android NDK
-        uses: nttld/setup-ndk@v1
-        id: setup-ndk
-        with:
-          ndk-version: r27c
-          add-to-path: true
-
-      # ── 4. Build bằng ndk-build ─────────────────────────────────────────
-      - name: Build with ndk-build
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+      - name: Install NDK ${{ env.NDK_VERSION }}
         run: |
-          echo "NDK path: $ANDROID_NDK_HOME"
-          $ANDROID_NDK_HOME/ndk-build \
-            NDK_PROJECT_PATH=. \
-            NDK_APPLICATION_MK=jni/Application.mk \
+          echo "y" | sdkmanager "ndk;${{ env.NDK_VERSION }}"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
+          echo "NDK_ROOT=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}"       >> $GITHUB_ENV
+
+      # ── 3. Clone hev-socks5-tunnel (với submodule) ────────────────────────
+      - name: Clone hev-socks5-tunnel
+        run: |
+          mkdir -p hev_build
+          cd hev_build
+          git clone --recursive --depth 1 \
+            --branch "${{ env.HEV_TAG }}" \
+            https://github.com/heiher/hev-socks5-tunnel jni
+          echo "HEV_VERSION=$(git -C jni describe --tags --always)" >> $GITHUB_ENV
+
+      # ── 4. Chạy ndk-build ────────────────────────────────────────────────
+      - name: ndk-build
+        working-directory: hev_build
+        run: |
+          "${{ env.ANDROID_NDK_HOME }}/ndk-build" \
+            APP_ABI="${{ env.ABIS }}" \
+            APP_PLATFORM=android-21 \
             APP_BUILD_SCRIPT=jni/Android.mk \
-            NDK_LIBS_OUT=./libs \
-            NDK_OUT=./obj \
-            -j$(nproc) \
-            V=1
+            APP_OPTIM=release \
+            -j$(nproc)
 
-      # ── 5. List kết quả ─────────────────────────────────────────────────
-      - name: List output files
+      # ── 5. Kiểm tra output ────────────────────────────────────────────────
+      - name: List built libraries
+        run: find hev_build/libs -name "*.so" | sort
+
+      # ── 6. Copy .so vào jniLibs của project (tuỳ chỉnh đường dẫn) ────────
+      - name: Copy .so into MTunnel jniLibs
         run: |
-          echo "=== Built .so files ==="
-          find libs -name "*.so" -exec ls -lh {} \;
+          JNILIBS="app/src/main/jniLibs"
+          mkdir -p "$JNILIBS"
+          for abi in ${{ env.ABIS }}; do
+            src="hev_build/libs/$abi/libhev-socks5-tunnel.so"
+            dst="$JNILIBS/$abi/"
+            if [ -f "$src" ]; then
+              mkdir -p "$dst"
+              cp "$src" "$dst"
+              echo "✅  $abi → $dst"
+            else
+              echo "⚠️  Không tìm thấy: $src"
+            fi
+          done
 
-      # ── 6. Đóng gói zip ─────────────────────────────────────────────────
-      - name: Package artifact
-        run: |
-          mkdir -p artifact/jni
-          cp -r libs/arm64-v8a   artifact/jni/ 2>/dev/null || true
-          cp -r libs/armeabi-v7a artifact/jni/ 2>/dev/null || true
-          cp -r libs/x86         artifact/jni/ 2>/dev/null || true
-          cp -r libs/x86_64      artifact/jni/ 2>/dev/null || true
-          cd artifact
-          zip -r ../hev-socks5-tunnel-android.zip jni/
-          cd ..
-          echo "=== Zip contents ==="
-          unzip -l hev-socks5-tunnel-android.zip
-
-      # ── 7. Upload artifact ───────────────────────────────────────────────
-      - name: Upload artifact
+      # ── 7. Upload artifact ────────────────────────────────────────────────
+      - name: Upload .so as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hev-socks5-tunnel-android
-          path: hev-socks5-tunnel-android.zip
+          name: hev-socks5-tunnel-android-${{ env.HEV_VERSION }}
+          path: hev_build/libs/
           retention-days: 30
+
+      # ── (Tuỳ chọn) 8. Build MTunnel APK sau khi đã có .so ────────────────
+      # - name: Build MTunnel debug APK
+      #   run: ./gradlew assembleDebug
+      #
+      # - name: Upload APK
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: MTunnel-debug
+      #     path: app/build/outputs/apk/debug/*.apk
