@@ -21,7 +21,6 @@ on:
 env:
   HEV_TAG: ${{ github.event.inputs.hev_tag || 'main' }}
   NDK_VERSION: ${{ github.event.inputs.ndk_version || '27.2.12479018' }}
-  # Các ABI cần build — bỏ bớt nếu không dùng x86/x86_64
   ABIS: "armeabi-v7a arm64-v8a x86 x86_64"
 
 jobs:
@@ -30,11 +29,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ── 1. Checkout repo chính (MTunnel) ──────────────────────────────────
       - name: Checkout MTunnel
         uses: actions/checkout@v4
 
-      # ── 2. Cài Android SDK + NDK ──────────────────────────────────────────
       - name: Set up Android SDK / NDK
         uses: android-actions/setup-android@v3
 
@@ -42,9 +39,7 @@ jobs:
         run: |
           echo "y" | sdkmanager "ndk;${{ env.NDK_VERSION }}"
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
-          echo "NDK_ROOT=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}"       >> $GITHUB_ENV
 
-      # ── 3. Clone hev-socks5-tunnel (với submodule) ────────────────────────
       - name: Clone hev-socks5-tunnel
         run: |
           mkdir -p hev_build
@@ -54,7 +49,51 @@ jobs:
             https://github.com/heiher/hev-socks5-tunnel jni
           echo "HEV_VERSION=$(git -C jni describe --tags --always)" >> $GITHUB_ENV
 
-      # ── 4. Chạy ndk-build ────────────────────────────────────────────────
+      # ── In source tree để debug ───────────────────────────────────────────
+      - name: Show source structure
+        run: |
+          echo "=== ALL C/H FILES ==="
+          find hev_build/jni -name "*.c" -o -name "*.h" | sort
+          echo ""
+          echo "=== FILES CONTAINING TUNSETIFF ==="
+          grep -rn "TUNSETIFF" hev_build/jni/ --include="*.c" -l
+          echo ""
+          echo "=== hev_tunnel_open SIGNATURE ==="
+          grep -rn "hev_tunnel_open" hev_build/jni/ --include="*.c" --include="*.h"
+          echo ""
+          echo "=== TProxyStartService / JNI wrapper ==="
+          grep -rn "TProxyStartService\|JNI_OnLoad\|RegisterNatives" hev_build/jni/ --include="*.c"
+          echo ""
+          echo "=== hev_socks5_tunnel_main SIGNATURE ==="
+          grep -rn "hev_socks5_tunnel_main\b" hev_build/jni/ --include="*.c" --include="*.h"
+          echo ""
+          echo "=== TUNSETIFF context (10 lines) ==="
+          grep -rn "TUNSETIFF" hev_build/jni/ --include="*.c" -A5 -B5
+
+      # ── Patch: hev_tunnel_open nhận fd từ ngoài thay vì tự open() ─────────
+      - name: Patch hev_tunnel_open to accept external fd
+        run: |
+          python3 << 'PYEOF'
+          import glob, re, sys
+
+          # Tìm file implement hev_tunnel_open (chứa TUNSETIFF)
+          files = glob.glob('hev_build/jni/**/*.c', recursive=True)
+          tunnel_file = None
+          for f in files:
+              if 'TUNSETIFF' in open(f).read():
+                  tunnel_file = f
+                  break
+
+          if not tunnel_file:
+              print("ERROR: TUNSETIFF not found in any .c file")
+              sys.exit(1)
+
+          print(f"Patching: {tunnel_file}")
+          content = open(tunnel_file).read()
+          print("=== ORIGINAL CONTENT ===")
+          print(content[:3000])
+          PYEOF
+
       - name: ndk-build
         working-directory: hev_build
         run: |
@@ -65,11 +104,9 @@ jobs:
             APP_OPTIM=release \
             -j$(nproc)
 
-      # ── 5. Kiểm tra output ────────────────────────────────────────────────
       - name: List built libraries
         run: find hev_build/libs -name "*.so" | sort
 
-      # ── 6. Copy .so vào jniLibs của project (tuỳ chỉnh đường dẫn) ────────
       - name: Copy .so into MTunnel jniLibs
         run: |
           JNILIBS="app/src/main/jniLibs"
@@ -86,20 +123,10 @@ jobs:
             fi
           done
 
-      # ── 7. Upload artifact ────────────────────────────────────────────────
       - name: Upload .so as artifact
         uses: actions/upload-artifact@v4
         with:
           name: hev-socks5-tunnel-android-${{ env.HEV_VERSION }}
           path: hev_build/libs/
           retention-days: 30
-
-      # ── (Tuỳ chọn) 8. Build MTunnel APK sau khi đã có .so ────────────────
-      # - name: Build MTunnel debug APK
-      #   run: ./gradlew assembleDebug
-      #
-      # - name: Upload APK
-      #   uses: actions/upload-artifact@v4
-      #   with:
-      #     name: MTunnel-debug
-      #     path: app/build/outputs/apk/debug/*.apk
+          
