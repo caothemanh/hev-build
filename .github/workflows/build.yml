@@ -1,10 +1,9 @@
-name: Build hev-socks5-tunnel Android (patch dev/tun)
+name: Build hev-socks5-tunnel Android (inject-fd patch)
 
 on:
   workflow_dispatch:
     inputs:
       hev_tag:
-        description: 'hev-socks5-tunnel git tag/branch'
         required: false
         default: 'main'
       ndk_version:
@@ -38,34 +37,157 @@ jobs:
             https://github.com/heiher/hev-socks5-tunnel hev_build/jni
           echo "HEV_VERSION=$(git -C hev_build/jni describe --tags --always)" >> $GITHUB_ENV
 
-      # ── In source để xác nhận cấu trúc ──────────────────────────────────
-      - name: Show source structure
+      # Patch: inject g_tun_fd global để bypass open("/dev/tun")
+      # Cơ chế:
+      #   Java set g_tun_fd = detachFd() trước khi gọi TProxyStartService
+      #   hev_tunnel_open: nếu g_tun_fd >= 0 → dùng luôn, bỏ qua open()
+      - name: Apply inject-fd patch
         run: |
-          echo "=== C files ==="
-          find hev_build/jni/src -name "*.c" | sort
-          echo ""
-          echo "=== /dev/net/tun references ==="
-          grep -rn "dev/net/tun\|dev/tun\|TUNSETIFF" hev_build/jni/src/ --include="*.c"
+          python3 - << 'PYEOF'
+          import glob, re, sys
 
-      # ── PATCH: thay /dev/net/tun → /dev/tun ─────────────────────────────
-      # Android dùng /dev/tun (không có thư mục con net/)
-      # SELinux policy của untrusted_app cho phép open /dev/tun qua VpnService
-      # nhưng hev hardcode /dev/net/tun → fail
-      - name: Patch /dev/net/tun → /dev/tun
-        run: |
-          echo "=== Patching ==="
-          # Thay thế trong tất cả .c và .h files
-          grep -rln "dev/net/tun" hev_build/jni/src/ | while read f; do
-            echo "Patching: $f"
-            sed -i 's|/dev/net/tun|/dev/tun|g' "$f"
-            # Verify
-            grep -n "dev/tun" "$f"
-          done
+          src = 'hev_build/jni/src'
 
-          echo "=== Verify no /dev/net/tun left ==="
-          grep -rn "dev/net/tun" hev_build/jni/src/ && echo "STILL FOUND!" || echo "Clean"
+          # ── Bước 1: tìm file hev_tunnel_open ────────────────────────────
+          tun_file = None
+          for f in sorted(glob.glob(f'{src}/**/*.c', recursive=True)):
+              c = open(f).read()
+              if 'hev_tunnel_open' in c and ('open' in c) and ('ioctl' in c or 'TUNSETIFF' in c):
+                  tun_file = f
+                  print(f"[tunnel_open] {f}")
+                  break
 
-      # ── Build ─────────────────────────────────────────────────────────────
+          if not tun_file:
+              # Fallback: tìm file có /dev/net/tun hoặc /dev/tun
+              for f in sorted(glob.glob(f'{src}/**/*.c', recursive=True)):
+                  c = open(f).read()
+                  if '/dev/' in c and 'tun' in c:
+                      tun_file = f
+                      print(f"[tunnel_open fallback] {f}")
+                      break
+
+          if not tun_file:
+              print("ERROR: cannot find tunnel open file")
+              print("Available .c files:")
+              for f in sorted(glob.glob(f'{src}/**/*.c', recursive=True)):
+                  print(f"  {f}")
+              sys.exit(1)
+
+          # ── Bước 2: patch hev_tunnel_open ───────────────────────────────
+          content = open(tun_file).read()
+
+          # Thêm global g_tun_fd ngay sau các #include
+          if 'int g_tun_fd' not in content:
+              # Tìm vị trí sau include cuối
+              last_include = 0
+              for m in re.finditer(r'^#include\s+[<"][^">\n]+[">]', content, re.MULTILINE):
+                  last_include = m.end()
+              insert = '\n\n/* injected: fd from Java VpnService */\nint g_tun_fd = -1;\n'
+              content = content[:last_include] + insert + content[last_include:]
+              print(f"[patch] added g_tun_fd to {tun_file}")
+
+          # Patch open() call: bỏ qua nếu g_tun_fd >= 0
+          # Pattern: fd = open("...tun...", flags) hoặc fd = hev_task_io_open("...tun...", flags)
+          def patch_open(m):
+              original = m.group(0)
+              # Bọc bằng điều kiện g_tun_fd
+              return f'((g_tun_fd >= 0) ? (fd = g_tun_fd, 0) : ({original.strip()}, 0), fd)'
+
+          # Tìm pattern mở tun trong hev_tunnel_open function
+          # Cách an toàn: chèn code trước dòng open()
+          lines = content.splitlines(keepends=True)
+          new_lines = []
+          in_tunnel_open = False
+          brace_depth = 0
+          patched_open = False
+
+          for i, line in enumerate(lines):
+              # Detect function start
+              if re.search(r'\bhev_tunnel_open\b.*\{', line) or \
+                 (re.search(r'\bhev_tunnel_open\b', line) and i+1 < len(lines) and '{' in lines[i+1]):
+                  in_tunnel_open = True
+                  brace_depth = 0
+
+              if in_tunnel_open:
+                  brace_depth += line.count('{') - line.count('}')
+                  if brace_depth <= 0 and i > 0:
+                      in_tunnel_open = False
+
+                  # Tìm dòng có open() mở /dev/tun hoặc mở tun
+                  if not patched_open and re.search(r'\bopen\s*\(', line) and \
+                     ('tun' in line.lower() or 'dev' in line.lower() or 'O_RDWR' in line):
+                      # Chèn kiểm tra g_tun_fd trước dòng này
+                      indent = len(line) - len(line.lstrip())
+                      spaces = ' ' * indent
+                      new_lines.append(f'{spaces}if (g_tun_fd >= 0) {{\n')
+                      new_lines.append(f'{spaces}    fd = g_tun_fd;\n')
+                      new_lines.append(f'{spaces}}} else {{\n')
+                      new_lines.append(line.rstrip() + '\n')
+                      new_lines.append(f'{spaces}}}\n')
+                      patched_open = True
+                      print(f"[patch] patched open() at line {i+1}: {line.strip()}")
+                      continue
+
+              new_lines.append(line)
+
+          if not patched_open:
+              print("[warn] open() in hev_tunnel_open not found, trying global replace")
+              # Fallback: global replace /dev/net/tun → /dev/tun và thêm g_tun_fd check
+              content = '\n'.join(l.rstrip() for l in new_lines)
+              # Thêm g_tun_fd check wrap toàn bộ open tun call
+              content = re.sub(
+                  r'(\bfd\s*=\s*(?:hev_task_io_)?open\s*\([^;]*(?:/dev/tun|/dev/net/tun)[^;]*;)',
+                  r'if (g_tun_fd >= 0) { fd = g_tun_fd; } else { \1 }',
+                  content
+              )
+          else:
+              content = ''.join(new_lines)
+
+          open(tun_file, 'w').write(content)
+          print(f"[patch] {tun_file} saved")
+
+          # ── Bước 3: tìm và patch JNI/main file ──────────────────────────
+          jni_file = None
+          for f in sorted(glob.glob(f'{src}/**/*.c', recursive=True)):
+              c = open(f).read()
+              if 'JNI_OnLoad' in c or ('TProxyStartService' in c and 'JNIEnv' in c):
+                  jni_file = f
+                  print(f"[jni] {f}")
+                  break
+
+          if jni_file:
+              content = open(jni_file).read()
+              # Thêm extern g_tun_fd và set nó trước hev_socks5_tunnel_main
+              if 'extern int g_tun_fd' not in content:
+                  # Tìm TProxyStartService hoặc hev_socks5_tunnel_main call
+                  # Thêm: extern int g_tun_fd; g_tun_fd = tun_fd;
+                  content = re.sub(
+                      r'(hev_socks5_tunnel_main\s*\()',
+                      'extern int g_tun_fd; g_tun_fd = tun_fd; \n    hev_socks5_tunnel_main(',
+                      content
+                  )
+                  # Nếu không tìm thấy, thử tìm call khác
+                  if 'g_tun_fd' not in content:
+                      content = re.sub(
+                          r'(hev_socks5_tunnel_main_from_file\s*\()',
+                          'extern int g_tun_fd; g_tun_fd = tun_fd; \n    hev_socks5_tunnel_main_from_file(',
+                          content
+                      )
+                  open(jni_file, 'w').write(content)
+                  print(f"[patch] JNI patched: {jni_file}")
+          else:
+              print("[warn] JNI file not found, g_tun_fd must be set by another mechanism")
+
+          # ── Kiểm tra kết quả ─────────────────────────────────────────────
+          print("\n=== PATCH RESULT ===")
+          print(f"\n-- {tun_file} (relevant section) --")
+          content = open(tun_file).read()
+          for i, line in enumerate(content.splitlines()):
+              if 'g_tun_fd' in line or 'hev_tunnel_open' in line or 'open' in line.lower():
+                  print(f"{i+1:4}: {line}")
+
+          PYEOF
+
       - name: ndk-build
         working-directory: hev_build
         run: |
@@ -76,11 +198,12 @@ jobs:
             APP_OPTIM=release \
             -j$(nproc)
 
-      - name: List built libraries
+      - name: Verify patch in .so
         run: |
-          find hev_build/libs -name "*.so" | sort
-          echo "=== arm64-v8a size ==="
-          ls -lh hev_build/libs/arm64-v8a/libhev-socks5-tunnel.so 2>/dev/null || true
+          echo "=== Strings in .so ==="
+          strings hev_build/libs/arm64-v8a/libhev-socks5-tunnel.so | grep -E "dev/|g_tun_fd|tun_fd"
+          echo "=== g_tun_fd symbol ==="
+          nm -D hev_build/libs/arm64-v8a/libhev-socks5-tunnel.so | grep g_tun_fd
 
       - name: Copy .so into MTunnel jniLibs
         run: |
@@ -92,16 +215,16 @@ jobs:
             if [ -f "$src" ]; then
               mkdir -p "$dst"
               cp "$src" "$dst"
-              echo "✅  $abi → $dst"
+              echo "✅  $abi"
             else
-              echo "⚠️  Not found: $src"
+              echo "⚠️  $abi not found"
             fi
           done
 
-      - name: Upload .so
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: hev-socks5-tunnel-devtun-patch-${{ env.HEV_VERSION }}
+          name: hev-inject-fd-${{ env.HEV_VERSION }}
           path: hev_build/libs/
           retention-days: 30
           
