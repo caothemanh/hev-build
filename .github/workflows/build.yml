@@ -37,144 +37,126 @@ jobs:
             https://github.com/heiher/hev-socks5-tunnel hev_build/jni
           echo "HEV_VERSION=$(git -C hev_build/jni describe --tags --always)" >> $GITHUB_ENV
 
-      - name: Show hev-jni.c and tunnel open file
+      - name: Show Android tunnel file
         run: |
-          echo "=== hev-jni.c ==="
-          cat hev_build/jni/src/hev-jni.c
+          echo "=== All tunnel .c files ==="
+          find hev_build/jni/src -name "hev-tunnel*.c" | sort
           echo ""
-          echo "=== File with open()/TUNSETIFF ==="
-          TFILE=$(grep -rl "TUNSETIFF\|/dev/tun\|/dev/net/tun" hev_build/jni/src/ --include="*.c" | head -1)
-          echo "File: $TFILE"
-          cat "$TFILE"
+          echo "=== Android tunnel file ==="
+          cat hev_build/jni/src/hev-tunnel-android.c 2>/dev/null || \
+          cat hev_build/jni/src/hev-tunnel-linux.c 2>/dev/null || \
+          (grep -rl "TUNSETIFF\|IFF_TUN" hev_build/jni/src/ --include="*.c" | head -1 | xargs cat)
 
-      - name: Apply inject-fd patch
+      - name: Apply patch
         run: |
           python3 - << 'PYEOF'
           import glob, re, sys
 
           src = 'hev_build/jni/src'
 
-          # ── Đọc hev-jni.c để biết tên biến fd thực tế ───────────────────
-          jni_content = open(f'{src}/hev-jni.c').read()
-          print("=== hev-jni.c ===")
-          print(jni_content)
-
-          # Tìm tên tham số fd trong TProxyStartService (thường là arg thứ 3 của JNI = jint)
-          # Pattern: Java_..._TProxyStartService(JNIEnv *env, jobject obj, jstring cfg, jint tunFd)
-          m = re.search(r'TProxyStartService\s*\([^)]+jint\s+(\w+)', jni_content)
-          fd_param = m.group(1) if m else None
-          print(f"\nFd parameter name: {fd_param}")
-
-          # Tìm call đến hev_socks5_tunnel_main
-          m2 = re.search(r'hev_socks5_tunnel_main\w*\s*\([^;]+;', jni_content)
-          print(f"Main call: {m2.group(0) if m2 else 'not found'}")
-
-          # ── Tìm file tunnel open ─────────────────────────────────────────
+          # ── Tìm đúng file Android tunnel (có TUNSETIFF) ──────────────────
           tun_file = None
-          for f in sorted(glob.glob(f'{src}/**/*.c', recursive=True)):
+          for f in sorted(glob.glob(f'{src}/hev-tunnel*.c')):
               c = open(f).read()
-              if ('TUNSETIFF' in c or '/dev/tun' in c or '/dev/net/tun' in c) and 'open' in c:
+              if 'TUNSETIFF' in c or 'IFF_TUN' in c:
                   tun_file = f
                   break
-          print(f"\nTunnel file: {tun_file}")
-          if tun_file:
-              print(open(tun_file).read())
-
-          PYEOF
-
-      - name: Patch files
-        run: |
-          python3 - << 'PYEOF'
-          import glob, re, sys
-
-          src = 'hev_build/jni/src'
-          jni_content = open(f'{src}/hev-jni.c').read()
-
-          # Tìm tên biến fd thực tế trong hev-jni.c
-          # Pattern 1: jint <name> trong TProxyStartService
-          m = re.search(r'TProxyStartService[^{]+jint\s+(\w+)', jni_content, re.DOTALL)
-          fd_param = m.group(1) if m else 'tun_fd'
-          print(f"fd param name: '{fd_param}'")
-
-          # ── Patch hev-jni.c: thêm g_tun_fd trước main call ──────────────
-          # Tìm hev_socks5_tunnel_main call và chèn g_tun_fd = <fd_param>
-          if 'g_tun_fd' not in jni_content:
-              # Chèn trước bất kỳ call nào đến hev_socks5_tunnel_main*
-              jni_content = re.sub(
-                  r'(\bhev_socks5_tunnel_main\w*\s*\()',
-                  f'extern int g_tun_fd; g_tun_fd = {fd_param}; \\1',
-                  jni_content
-              )
-              open(f'{src}/hev-jni.c', 'w').write(jni_content)
-              print("Patched hev-jni.c")
-          else:
-              print("hev-jni.c already patched")
-
-          # ── Patch tunnel file: thêm g_tun_fd bypass ─────────────────────
-          tun_file = None
-          for f in sorted(glob.glob(f'{src}/**/*.c', recursive=True)):
-              c = open(f).read()
-              if ('TUNSETIFF' in c or '/dev/tun' in c) and 'open' in c:
-                  tun_file = f
-                  break
+          # Nếu không có file riêng, tìm trong tất cả .c
+          if not tun_file:
+              for f in sorted(glob.glob(f'{src}/**/*.c', recursive=True)):
+                  c = open(f).read()
+                  if 'TUNSETIFF' in c:
+                      tun_file = f
+                      break
 
           if not tun_file:
-              print("ERROR: tunnel file not found"); sys.exit(1)
+              print("Files available:"); [print(f) for f in sorted(glob.glob(f'{src}/**/*.c', recursive=True))]
+              sys.exit(1)
 
+          print(f"Patching tunnel file: {tun_file}")
           content = open(tun_file).read()
+          print("=== Content ===")
+          print(content[:3000])
 
-          # Thêm global declaration
-          if 'int g_tun_fd' not in content:
-              last_inc = 0
-              for mm in re.finditer(r'^#include\s+\S+', content, re.MULTILINE):
-                  last_inc = mm.end()
-              ins = '\n\nint g_tun_fd = -1;\n'
-              content = content[:last_inc] + ins + content[last_inc:]
+          # 1. Thêm global int g_tun_fd = -1
+          if 'g_tun_fd' not in content:
+              last_inc = max((m.end() for m in re.finditer(r'^#include\s+\S+', content, re.MULTILINE)), default=0)
+              content = content[:last_inc] + '\n\nint g_tun_fd = -1;\n' + content[last_inc:]
 
-          # Patch: wrap open() tun call với g_tun_fd check
-          # Tìm dòng: fd = open("...tun...) hoặc fd = hev_task_io_open(...)
+          # 2. Tìm dòng open() trong hev_tunnel_open và wrap với g_tun_fd check
+          # Pattern: <spaces>fd = open/hev_task_io_open(...);   hoặc
+          #          <spaces>tfd = open/hev_task_io_open(...);
           lines = content.splitlines(keepends=True)
           new_lines = []
           patched = False
-          for line in lines:
-              stripped = line.strip()
-              # Tìm dòng assign fd từ open() với tun
-              if not patched and re.search(r'\bfd\s*=\s*\w*open\s*\(', line) and \
-                 ('tun' in line.lower() or 'RDWR' in line):
-                  indent = ' ' * (len(line) - len(line.lstrip()))
-                  new_lines.append(f'{indent}if (g_tun_fd >= 0) {{\n')
-                  new_lines.append(f'{indent}    fd = g_tun_fd;\n')
-                  new_lines.append(f'{indent}}} else {{\n')
-                  new_lines.append(f'{indent}    {stripped}\n')
-                  new_lines.append(f'{indent}}}\n')
-                  patched = True
-                  print(f"Patched open(): {stripped}")
-                  continue
+          in_func = False
+          depth = 0
+
+          for i, line in enumerate(lines):
+              # Track khi vào hàm hev_tunnel_open
+              if re.search(r'\bhev_tunnel_open\b', line):
+                  in_func = True
+                  depth = 0
+
+              if in_func:
+                  depth += line.count('{') - line.count('}')
+                  if depth < 0:
+                      in_func = False
+
+              # Patch: dòng có open() trả về fd, trong hev_tunnel_open
+              if in_func and not patched:
+                  m = re.match(r'^(\s*)(\w+fd\w*)\s*=\s*(\w*open\w*)\s*\(([^;]+)\);', line.rstrip())
+                  if m:
+                      indent, fd_var, open_func, open_args = m.groups()
+                      new_lines.append(f'{indent}if (g_tun_fd >= 0) {{\n')
+                      new_lines.append(f'{indent}    {fd_var} = g_tun_fd;\n')
+                      new_lines.append(f'{indent}}} else {{\n')
+                      new_lines.append(f'{indent}    {fd_var} = {open_func} ({open_args});\n')
+                      new_lines.append(f'{indent}}}\n')
+                      patched = True
+                      print(f"Patched line {i+1}: {line.rstrip()}")
+                      continue
+
               new_lines.append(line)
 
           if not patched:
-              print("WARN: could not find open() line, trying regex replace")
-              content = re.sub(
-                  r'(\bfd\s*=\s*\w*open\s*\([^;]+;)',
-                  r'if (g_tun_fd >= 0) { fd = g_tun_fd; } else { \1 }',
-                  content
+              print("WARNING: could not auto-patch, showing open() lines in hev_tunnel_open:")
+              for i, l in enumerate(lines):
+                  if 'open' in l and ('tun' in l.lower() or 'fd' in l.lower()):
+                      print(f"  {i+1}: {l.rstrip()}")
+
+          open(tun_file, 'w').write(''.join(new_lines))
+
+          # ── Patch hev-jni.c ──────────────────────────────────────────────
+          # Từ source đã đọc:
+          #   thread_handler gọi hev_socks5_tunnel_main(tdata->path, tdata->fd)
+          #   cần set g_tun_fd = tdata->fd trước đó
+          jni_path = f'{src}/hev-jni.c'
+          jni = open(jni_path).read()
+
+          if 'g_tun_fd' not in jni:
+              # Thêm extern khai báo sau includes
+              last_inc = max((m.end() for m in re.finditer(r'^#include\s+\S+', jni, re.MULTILINE)), default=0)
+              jni = jni[:last_inc] + '\nextern int g_tun_fd;\n' + jni[last_inc:]
+
+              # Thêm g_tun_fd = tdata->fd; trước hev_socks5_tunnel_main
+              jni = jni.replace(
+                  'hev_socks5_tunnel_main (tdata->path, tdata->fd);',
+                  'g_tun_fd = tdata->fd;\n    hev_socks5_tunnel_main (tdata->path, tdata->fd);'
               )
-          else:
-              content = ''.join(new_lines)
+              open(jni_path, 'w').write(jni)
+              print("Patched hev-jni.c: g_tun_fd = tdata->fd")
 
-          open(tun_file, 'w').write(content)
-          print(f"Saved {tun_file}")
+          # ── Verify ───────────────────────────────────────────────────────
+          print("\n=== Tunnel file (g_tun_fd lines) ===")
+          for i, l in enumerate(open(tun_file).read().splitlines()):
+              if 'g_tun_fd' in l or ('open' in l and 'fd' in l.lower()):
+                  print(f"{i+1:4}: {l}")
 
-          # Show result
-          print("\n=== Patched tunnel file (open/g_tun_fd lines) ===")
-          for i, line in enumerate(open(tun_file).read().splitlines()):
-              if 'g_tun_fd' in line or ('open' in line and 'tun' in line.lower()):
-                  print(f"{i+1:4}: {line}")
-
-          print("\n=== Patched hev-jni.c (g_tun_fd lines) ===")
-          for i, line in enumerate(open(f'{src}/hev-jni.c').read().splitlines()):
-              if 'g_tun_fd' in line or 'hev_socks5_tunnel_main' in line:
-                  print(f"{i+1:4}: {line}")
+          print("\n=== hev-jni.c (g_tun_fd lines) ===")
+          for i, l in enumerate(open(jni_path).read().splitlines()):
+              if 'g_tun_fd' in l or 'hev_socks5_tunnel_main' in l:
+                  print(f"{i+1:4}: {l}")
           PYEOF
 
       - name: ndk-build
@@ -187,12 +169,12 @@ jobs:
             APP_OPTIM=release \
             -j$(nproc)
 
-      - name: Verify
+      - name: Verify .so
         run: |
-          echo "=== g_tun_fd symbol exported ==="
-          nm -D hev_build/libs/arm64-v8a/libhev-socks5-tunnel.so | grep g_tun_fd || echo "not exported (OK if static)"
-          echo "=== dev strings ==="
+          echo "=== dev/ strings ==="
           strings hev_build/libs/arm64-v8a/libhev-socks5-tunnel.so | grep "dev/"
+          echo "=== size ==="
+          ls -lh hev_build/libs/arm64-v8a/libhev-socks5-tunnel.so
 
       - name: Copy .so into MTunnel jniLibs
         run: |
