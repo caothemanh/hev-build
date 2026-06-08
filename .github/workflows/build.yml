@@ -1,197 +1,154 @@
-name: Build hev-socks5-tunnel Android (inject-fd patch)
+name: Build hev-socks5-tunnel Android
 
 on:
+  push:
+    branches: [ main, master ]
   workflow_dispatch:
     inputs:
-      hev_tag:
+      hev_ref:
+        description: 'hev-socks5-tunnel branch/tag (default: main)'
         required: false
         default: 'main'
-      ndk_version:
-        required: false
-        default: '27.2.12479018'
-
-env:
-  HEV_TAG: ${{ github.event.inputs.hev_tag || 'main' }}
-  NDK_VERSION: ${{ github.event.inputs.ndk_version || '27.2.12479018' }}
-  ABIS: "armeabi-v7a arm64-v8a"
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+
     steps:
-      - name: Checkout MTunnel
+      - name: Checkout this repo
         uses: actions/checkout@v4
 
-      - name: Set up Android SDK / NDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install NDK
+      # ── Clone hev theo đúng cấu trúc mà ndk-build yêu cầu ───────────────
+      # hev hướng dẫn: mkdir wrapper; clone vào wrapper/jni/; ndk-build từ wrapper/
+      - name: Clone hev-socks5-tunnel into build/jni
         run: |
-          echo "y" | sdkmanager "ndk;${{ env.NDK_VERSION }}"
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
+          REF="${{ github.event.inputs.hev_ref || 'main' }}"
+          echo "Cloning hev ref=$REF"
+          git clone --recursive --depth=1 --branch "$REF" \
+            https://github.com/heiher/hev-socks5-tunnel \
+            build/jni
+          echo "HEV_VERSION=$(git -C build/jni describe --tags --always 2>/dev/null || echo $REF)" >> $GITHUB_ENV
+          echo "=== src/ files ==="
+          ls build/jni/src/
+          echo "=== Android.mk ==="
+          cat build/jni/Android.mk
 
-      - name: Clone hev-socks5-tunnel
+      # ── Copy TProxyService.c vào src/ của hev ────────────────────────────
+      # Sau đó patch Android.mk gốc của hev để:
+      #   1. Thêm src/TProxyService.c vào SRCFILES
+      #   2. Thêm -llog vào LOCAL_LDLIBS
+      - name: Inject TProxyService.c and patch Android.mk
         run: |
-          git clone --recursive --depth 1 \
-            --branch "${{ env.HEV_TAG }}" \
-            https://github.com/heiher/hev-socks5-tunnel hev_build/jni
-          echo "HEV_VERSION=$(git -C hev_build/jni describe --tags --always)" >> $GITHUB_ENV
+          # Copy wrapper
+          cp jni/TProxyService.c build/jni/src/TProxyService.c
+          echo "✅ Copied TProxyService.c"
 
-      - name: Show Android tunnel file
-        run: |
-          echo "=== All tunnel .c files ==="
-          find hev_build/jni/src -name "hev-tunnel*.c" | sort
-          echo ""
-          echo "=== Android tunnel file ==="
-          cat hev_build/jni/src/hev-tunnel-android.c 2>/dev/null || \
-          cat hev_build/jni/src/hev-tunnel-linux.c 2>/dev/null || \
-          (grep -rl "TUNSETIFF\|IFF_TUN" hev_build/jni/src/ --include="*.c" | head -1 | xargs cat)
+          # Patch Android.mk của hev bằng Python (không dùng sed để tránh escape issues)
+          python3 << 'PYEOF'
+          with open('build/jni/Android.mk', 'r') as f:
+              content = f.read()
 
-      - name: Apply patch
-        run: |
-          python3 - << 'PYEOF'
-          import glob, re, sys
+          original = content
 
-          src = 'hev_build/jni/src'
-
-          # ── Tìm đúng file Android tunnel (có TUNSETIFF) ──────────────────
-          tun_file = None
-          for f in sorted(glob.glob(f'{src}/hev-tunnel*.c')):
-              c = open(f).read()
-              if 'TUNSETIFF' in c or 'IFF_TUN' in c:
-                  tun_file = f
-                  break
-          # Nếu không có file riêng, tìm trong tất cả .c
-          if not tun_file:
-              for f in sorted(glob.glob(f'{src}/**/*.c', recursive=True)):
-                  c = open(f).read()
-                  if 'TUNSETIFF' in c:
-                      tun_file = f
-                      break
-
-          if not tun_file:
-              print("Files available:"); [print(f) for f in sorted(glob.glob(f'{src}/**/*.c', recursive=True))]
-              sys.exit(1)
-
-          print(f"Patching tunnel file: {tun_file}")
-          content = open(tun_file).read()
-          print("=== Content ===")
-          print(content[:3000])
-
-          # 1. Thêm global int g_tun_fd = -1
-          if 'g_tun_fd' not in content:
-              last_inc = max((m.end() for m in re.finditer(r'^#include\s+\S+', content, re.MULTILINE)), default=0)
-              content = content[:last_inc] + '\n\nint g_tun_fd = -1;\n' + content[last_inc:]
-
-          # 2. Tìm dòng open() trong hev_tunnel_open và wrap với g_tun_fd check
-          # Pattern: <spaces>fd = open/hev_task_io_open(...);   hoặc
-          #          <spaces>tfd = open/hev_task_io_open(...);
-          lines = content.splitlines(keepends=True)
-          new_lines = []
-          patched = False
-          in_func = False
-          depth = 0
-
-          for i, line in enumerate(lines):
-              # Track khi vào hàm hev_tunnel_open
-              if re.search(r'\bhev_tunnel_open\b', line):
-                  in_func = True
-                  depth = 0
-
-              if in_func:
-                  depth += line.count('{') - line.count('}')
-                  if depth < 0:
-                      in_func = False
-
-              # Patch: dòng có open() trả về fd, trong hev_tunnel_open
-              if in_func and not patched:
-                  m = re.match(r'^(\s*)(\w+fd\w*)\s*=\s*(\w*open\w*)\s*\(([^;]+)\);', line.rstrip())
-                  if m:
-                      indent, fd_var, open_func, open_args = m.groups()
-                      new_lines.append(f'{indent}if (g_tun_fd >= 0) {{\n')
-                      new_lines.append(f'{indent}    {fd_var} = g_tun_fd;\n')
-                      new_lines.append(f'{indent}}} else {{\n')
-                      new_lines.append(f'{indent}    {fd_var} = {open_func} ({open_args});\n')
-                      new_lines.append(f'{indent}}}\n')
-                      patched = True
-                      print(f"Patched line {i+1}: {line.rstrip()}")
-                      continue
-
-              new_lines.append(line)
-
-          if not patched:
-              print("WARNING: could not auto-patch, showing open() lines in hev_tunnel_open:")
-              for i, l in enumerate(lines):
-                  if 'open' in l and ('tun' in l.lower() or 'fd' in l.lower()):
-                      print(f"  {i+1}: {l.rstrip()}")
-
-          open(tun_file, 'w').write(''.join(new_lines))
-
-          # ── Patch hev-jni.c ──────────────────────────────────────────────
-          # Từ source đã đọc:
-          #   thread_handler gọi hev_socks5_tunnel_main(tdata->path, tdata->fd)
-          #   cần set g_tun_fd = tdata->fd trước đó
-          jni_path = f'{src}/hev-jni.c'
-          jni = open(jni_path).read()
-
-          if 'g_tun_fd' not in jni:
-              # Thêm extern khai báo sau includes
-              last_inc = max((m.end() for m in re.finditer(r'^#include\s+\S+', jni, re.MULTILINE)), default=0)
-              jni = jni[:last_inc] + '\nextern int g_tun_fd;\n' + jni[last_inc:]
-
-              # Thêm g_tun_fd = tdata->fd; trước hev_socks5_tunnel_main
-              jni = jni.replace(
-                  'hev_socks5_tunnel_main (tdata->path, tdata->fd);',
-                  'g_tun_fd = tdata->fd;\n    hev_socks5_tunnel_main (tdata->path, tdata->fd);'
+          # 1. Thêm TProxyService.c vào SRCFILES ngay sau "include $(LOCAL_PATH)/build.mk"
+          #    build.mk định nghĩa SRCFILES, ta append thêm vào
+          marker = 'include $(LOCAL_PATH)/build.mk'
+          if marker in content and 'TProxyService' not in content:
+              content = content.replace(
+                  marker,
+                  marker + '\nSRCFILES += $(LOCAL_PATH)/src/TProxyService.c'
               )
-              open(jni_path, 'w').write(jni)
-              print("Patched hev-jni.c: g_tun_fd = tdata->fd")
+              print("✅ Added TProxyService.c to SRCFILES")
+          else:
+              print(f"⚠️  marker found={marker in content}, already patched={('TProxyService' in content)}")
 
-          # ── Verify ───────────────────────────────────────────────────────
-          print("\n=== Tunnel file (g_tun_fd lines) ===")
-          for i, l in enumerate(open(tun_file).read().splitlines()):
-              if 'g_tun_fd' in l or ('open' in l and 'fd' in l.lower()):
-                  print(f"{i+1:4}: {l}")
+          # 2. Thêm -llog vào LOCAL_LDLIBS (ngay trước BUILD_SHARED_LIBRARY)
+          build_marker = 'include $(BUILD_SHARED_LIBRARY)'
+          if build_marker in content and '-llog' not in content:
+              content = content.replace(
+                  build_marker,
+                  'LOCAL_LDLIBS += -llog\n' + build_marker
+              )
+              print("✅ Added -llog to LOCAL_LDLIBS")
 
-          print("\n=== hev-jni.c (g_tun_fd lines) ===")
-          for i, l in enumerate(open(jni_path).read().splitlines()):
-              if 'g_tun_fd' in l or 'hev_socks5_tunnel_main' in l:
-                  print(f"{i+1:4}: {l}")
+          with open('build/jni/Android.mk', 'w') as f:
+              f.write(content)
+
+          print('\n=== Patched Android.mk ===')
+          print(content)
           PYEOF
 
+      # ── Tạo Application.mk (chỉ cần nếu hev chưa có, hoặc override ABI) ─
+      - name: Create Application.mk
+        run: |
+          # Ghi đè Application.mk để chọn đúng ABI và platform
+          cat > build/jni/Application.mk << 'EOF'
+          APP_ABI      := arm64-v8a armeabi-v7a x86 x86_64
+          APP_PLATFORM := android-21
+          APP_STL      := none
+          APP_OPTIM    := release
+          EOF
+          echo "=== Application.mk ==="
+          cat build/jni/Application.mk
+
+      # ── Setup NDK ─────────────────────────────────────────────────────────
+      - name: Setup NDK r27c
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+          add-to-path: true
+
+      # ── Build theo đúng cách hev hướng dẫn ───────────────────────────────
+      # ndk-build phải chạy từ thư mục CHỨA jni/ (tức là build/)
       - name: ndk-build
-        working-directory: hev_build
+        working-directory: build
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |
-          "${{ env.ANDROID_NDK_HOME }}/ndk-build" \
-            APP_ABI="${{ env.ABIS }}" \
-            APP_PLATFORM=android-21 \
-            APP_BUILD_SCRIPT=jni/Android.mk \
-            APP_OPTIM=release \
-            -j$(nproc)
+          echo "NDK: $ANDROID_NDK_HOME"
+          $ANDROID_NDK_HOME/ndk-build \
+            NDK_LIBS_OUT=./libs \
+            NDK_OUT=./obj \
+            -j$(nproc) \
+            V=1
 
-      - name: Verify .so
+      # ── Kiểm tra kết quả ──────────────────────────────────────────────────
+      - name: Verify output
         run: |
-          echo "=== dev/ strings ==="
-          strings hev_build/libs/arm64-v8a/libhev-socks5-tunnel.so | grep "dev/"
-          echo "=== size ==="
-          ls -lh hev_build/libs/arm64-v8a/libhev-socks5-tunnel.so
+          echo "=== Built .so files ==="
+          find build/libs -name "*.so" -exec ls -lh {} \;
 
-      - name: Copy .so into MTunnel jniLibs
-        run: |
-          for abi in ${{ env.ABIS }}; do
-            src="hev_build/libs/$abi/libhev-socks5-tunnel.so"
-            dst="app/src/main/jniLibs/$abi/"
-            if [ -f "$src" ]; then
-              mkdir -p "$dst"
-              cp "$src" "$dst"
-              echo "✅  $abi"
-            fi
+          echo ""
+          echo "=== Verify: hev_socks5_tunnel_main symbol ==="
+          for so in build/libs/*/libhev-socks5-tunnel.so; do
+            echo "--- $so ---"
+            nm -D "$so" 2>/dev/null | grep -E "hev_socks5_tunnel_main|TProxyStartService" || \
+            strings "$so" | grep -E "hev_socks5_tunnel_main|TProxyStart|TProxyStop|TProxyGet"
           done
 
-      - name: Upload
+          echo ""
+          echo "=== Verify: no /dev/net/tun open (should use fd passthrough) ==="
+          strings build/libs/arm64-v8a/libhev-socks5-tunnel.so | grep "/dev/net/tun" \
+            && echo "⚠️  WARNING: still opening /dev/net/tun directly" \
+            || echo "✅ No direct /dev/net/tun open — fd passthrough OK"
+
+      # ── Package zip ───────────────────────────────────────────────────────
+      - name: Package
+        run: |
+          mkdir -p artifact/jni
+          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+            [ -d "build/libs/$abi" ] && cp -r "build/libs/$abi" "artifact/jni/" && echo "✅ $abi"
+          done
+          cd artifact
+          zip -r ../hev-socks5-tunnel-android-${{ env.HEV_VERSION }}.zip jni/
+          echo "=== Zip contents ==="
+          unzip -l ../hev-socks5-tunnel-android-${{ env.HEV_VERSION }}.zip
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hev-inject-fd-${{ env.HEV_VERSION }}
-          path: hev_build/libs/
+          name: hev-socks5-tunnel-android-${{ env.HEV_VERSION }}
+          path: hev-socks5-tunnel-android-${{ env.HEV_VERSION }}.zip
           retention-days: 30
           
