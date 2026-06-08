@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       hev_ref:
-        description: 'hev-socks5-tunnel branch/tag (default: main)'
+        description: 'hev branch/tag (default: main)'
         required: false
         default: 'main'
 
@@ -15,83 +15,67 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout this repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # ── Clone hev theo đúng cấu trúc mà ndk-build yêu cầu ───────────────
-      # hev hướng dẫn: mkdir wrapper; clone vào wrapper/jni/; ndk-build từ wrapper/
-      - name: Clone hev-socks5-tunnel into build/jni
+      # Clone hev vào build/jni/ đúng theo hướng dẫn chính thức
+      - name: Clone hev-socks5-tunnel
         run: |
           REF="${{ github.event.inputs.hev_ref || 'main' }}"
-          echo "Cloning hev ref=$REF"
           git clone --recursive --depth=1 --branch "$REF" \
             https://github.com/heiher/hev-socks5-tunnel \
             build/jni
           echo "HEV_VERSION=$(git -C build/jni describe --tags --always 2>/dev/null || echo $REF)" >> $GITHUB_ENV
-          echo "=== src/ files ==="
-          ls build/jni/src/
-          echo "=== Android.mk ==="
-          cat build/jni/Android.mk
+          echo "=== src/ files ===" && ls build/jni/src/
+          echo "=== hev-jni.c PKGNAME/CLSNAME ===" && grep -n "PKGNAME\|CLSNAME" build/jni/src/hev-jni.c
 
-      # ── Copy TProxyService.c vào src/ của hev ────────────────────────────
-      # Sau đó patch Android.mk gốc của hev để:
-      #   1. Thêm src/TProxyService.c vào SRCFILES
-      #   2. Thêm -llog vào LOCAL_LDLIBS
-      - name: Inject TProxyService.c and patch Android.mk
+      # Patch PKGNAME thành com/v2ray/ang/service trong Android.mk
+      # hev-jni.c dùng: STR(PKGNAME) "/" STR(CLSNAME) để tạo class path
+      # Cần: "com/v2ray/ang/service/TProxyService"
+      - name: Patch PKGNAME in Android.mk
         run: |
-          # Copy wrapper
-          cp jni/TProxyService.c build/jni/src/TProxyService.c
-          echo "✅ Copied TProxyService.c"
-
-          # Patch Android.mk của hev bằng Python (không dùng sed để tránh escape issues)
           python3 << 'PYEOF'
           with open('build/jni/Android.mk', 'r') as f:
               content = f.read()
 
-          original = content
+          print("=== Original Android.mk ===")
+          print(content)
 
-          # 1. Thêm TProxyService.c vào SRCFILES ngay sau "include $(LOCAL_PATH)/build.mk"
-          #    build.mk định nghĩa SRCFILES, ta append thêm vào
-          marker = 'include $(LOCAL_PATH)/build.mk'
-          if marker in content and 'TProxyService' not in content:
+          # Thêm -DPKGNAME=com/v2ray/ang/service vào CFLAGS của hev-socks5-tunnel module
+          # Phải thêm TRƯỚC include $(BUILD_SHARED_LIBRARY)
+          if 'PKGNAME' not in content:
               content = content.replace(
-                  marker,
-                  marker + '\nSRCFILES += $(LOCAL_PATH)/src/TProxyService.c'
+                  'include $(BUILD_SHARED_LIBRARY)',
+                  'LOCAL_CFLAGS += -DPKGNAME=com/v2ray/ang/service\n'
+                  'include $(BUILD_SHARED_LIBRARY)'
               )
-              print("✅ Added TProxyService.c to SRCFILES")
+              print("✅ Patched PKGNAME")
           else:
-              print(f"⚠️  marker found={marker in content}, already patched={('TProxyService' in content)}")
-
-          # 2. Thêm -llog vào LOCAL_LDLIBS (ngay trước BUILD_SHARED_LIBRARY)
-          build_marker = 'include $(BUILD_SHARED_LIBRARY)'
-          if build_marker in content and '-llog' not in content:
-              content = content.replace(
-                  build_marker,
-                  'LOCAL_LDLIBS += -llog\n' + build_marker
+              # Override PKGNAME đã có
+              import re
+              content = re.sub(
+                  r'-DPKGNAME=\S+',
+                  '-DPKGNAME=com/v2ray/ang/service',
+                  content
               )
-              print("✅ Added -llog to LOCAL_LDLIBS")
+              print("✅ Replaced existing PKGNAME")
 
           with open('build/jni/Android.mk', 'w') as f:
               f.write(content)
 
-          print('\n=== Patched Android.mk ===')
+          print("\n=== Patched Android.mk ===")
           print(content)
           PYEOF
 
-      # ── Tạo Application.mk (chỉ cần nếu hev chưa có, hoặc override ABI) ─
       - name: Create Application.mk
         run: |
-          # Ghi đè Application.mk để chọn đúng ABI và platform
           cat > build/jni/Application.mk << 'EOF'
           APP_ABI      := arm64-v8a armeabi-v7a x86 x86_64
           APP_PLATFORM := android-21
           APP_STL      := none
           APP_OPTIM    := release
           EOF
-          echo "=== Application.mk ==="
-          cat build/jni/Application.mk
 
-      # ── Setup NDK ─────────────────────────────────────────────────────────
       - name: Setup NDK r27c
         uses: nttld/setup-ndk@v1
         id: ndk
@@ -99,51 +83,46 @@ jobs:
           ndk-version: r27c
           add-to-path: true
 
-      # ── Build theo đúng cách hev hướng dẫn ───────────────────────────────
-      # ndk-build phải chạy từ thư mục CHỨA jni/ (tức là build/)
       - name: ndk-build
         working-directory: build
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |
-          echo "NDK: $ANDROID_NDK_HOME"
           $ANDROID_NDK_HOME/ndk-build \
             NDK_LIBS_OUT=./libs \
             NDK_OUT=./obj \
             -j$(nproc) \
             V=1
 
-      # ── Kiểm tra kết quả ──────────────────────────────────────────────────
       - name: Verify output
         run: |
           echo "=== Built .so files ==="
           find build/libs -name "*.so" -exec ls -lh {} \;
 
           echo ""
-          echo "=== Verify: hev_socks5_tunnel_main symbol ==="
+          echo "=== Verify JNI class registration ==="
+          # JNI_OnLoad dùng dynamic registration, class path là string
+          # hev-jni.c: FindClass(env, STR(PKGNAME) "/" STR(CLSNAME))
+          # Sau patch: "com/v2ray/ang/service/TProxyService"
           for so in build/libs/*/libhev-socks5-tunnel.so; do
             echo "--- $so ---"
-            nm -D "$so" 2>/dev/null | grep -E "hev_socks5_tunnel_main|TProxyStartService" || \
-            strings "$so" | grep -E "hev_socks5_tunnel_main|TProxyStart|TProxyStop|TProxyGet"
+            strings "$so" | grep -E "TProxy|com/v2ray|hev/htproxy|ang/service"
           done
 
           echo ""
-          echo "=== Verify: no /dev/net/tun open (should use fd passthrough) ==="
+          echo "=== Verify: no /dev/net/tun (fd passthrough) ==="
           strings build/libs/arm64-v8a/libhev-socks5-tunnel.so | grep "/dev/net/tun" \
-            && echo "⚠️  WARNING: still opening /dev/net/tun directly" \
-            || echo "✅ No direct /dev/net/tun open — fd passthrough OK"
+            && echo "⚠️  Still opens /dev/net/tun directly" \
+            || echo "✅ No /dev/net/tun — uses fd passthrough"
 
-      # ── Package zip ───────────────────────────────────────────────────────
       - name: Package
         run: |
           mkdir -p artifact/jni
           for abi in arm64-v8a armeabi-v7a x86 x86_64; do
             [ -d "build/libs/$abi" ] && cp -r "build/libs/$abi" "artifact/jni/" && echo "✅ $abi"
           done
-          cd artifact
-          zip -r ../hev-socks5-tunnel-android-${{ env.HEV_VERSION }}.zip jni/
-          echo "=== Zip contents ==="
-          unzip -l ../hev-socks5-tunnel-android-${{ env.HEV_VERSION }}.zip
+          cd artifact && zip -r ../hev-socks5-tunnel-android-${{ env.HEV_VERSION }}.zip jni/
+          echo "=== Zip contents ===" && unzip -l ../hev-socks5-tunnel-android-${{ env.HEV_VERSION }}.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
