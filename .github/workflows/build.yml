@@ -29,9 +29,9 @@ jobs:
           echo "=== src/ files ===" && ls build/jni/src/
           echo "=== hev-jni.c PKGNAME/CLSNAME ===" && grep -n "PKGNAME\|CLSNAME" build/jni/src/hev-jni.c
 
-      # Patch PKGNAME thành com/v2ray/ang/service trong Android.mk
+      # Patch PKGNAME thành com/v2ray/services trong Android.mk
       # hev-jni.c dùng: STR(PKGNAME) "/" STR(CLSNAME) để tạo class path
-      # Cần: "com/v2ray/ang/service/TProxyService"
+      # Cần: "com/v2ray/services/TProxyService"
       - name: Patch PKGNAME in Android.mk
         run: |
           python3 << 'PYEOF'
@@ -41,12 +41,12 @@ jobs:
           print("=== Original Android.mk ===")
           print(content)
 
-          # Thêm -DPKGNAME=com/v2ray/ang/service vào CFLAGS của hev-socks5-tunnel module
+          # Thêm -DPKGNAME=com/v2ray/services vào CFLAGS của hev-socks5-tunnel module
           # Phải thêm TRƯỚC include $(BUILD_SHARED_LIBRARY)
           if 'PKGNAME' not in content:
               content = content.replace(
                   'include $(BUILD_SHARED_LIBRARY)',
-                  'LOCAL_CFLAGS += -DPKGNAME=com/v2ray/ang/service\n'
+                  'LOCAL_CFLAGS += -DPKGNAME=com/v2ray/services\n'
                   'include $(BUILD_SHARED_LIBRARY)'
               )
               print("✅ Patched PKGNAME")
@@ -55,7 +55,7 @@ jobs:
               import re
               content = re.sub(
                   r'-DPKGNAME=\S+',
-                  '-DPKGNAME=com/v2ray/ang/service',
+                  '-DPKGNAME=com/v2ray/services',
                   content
               )
               print("✅ Replaced existing PKGNAME")
@@ -103,7 +103,7 @@ jobs:
           echo "=== Verify JNI class registration ==="
           # JNI_OnLoad dùng dynamic registration, class path là string
           # hev-jni.c: FindClass(env, STR(PKGNAME) "/" STR(CLSNAME))
-          # Sau patch: "com/v2ray/ang/service/TProxyService"
+          # Sau patch: "com/v2ray/services/TProxyService"
           for so in build/libs/*/libhev-socks5-tunnel.so; do
             echo "--- $so ---"
             strings "$so" | grep -E "TProxy|com/v2ray|hev/htproxy|ang/service"
@@ -130,4 +130,3 @@ jobs:
           name: hev-socks5-tunnel-android-${{ env.HEV_VERSION }}
           path: hev-socks5-tunnel-android-${{ env.HEV_VERSION }}.zip
           retention-days: 30
-          
